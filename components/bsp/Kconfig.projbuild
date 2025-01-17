@@ -1,0 +1,106 @@
+menu "Project Configuration"
+
+    choice LCD_MODEL_SELECT
+        prompt "LCD model"
+        default LCD_DAXIAN_2_4
+        help
+            Select LCD model
+
+        config LCD_DAXIAN_2_0
+            bool "DaXian 2.0 inch spi LCD"
+
+        config LCD_DAXIAN_2_4
+            bool "DaXian 2.4 inch spi LCD"
+    endchoice
+
+    menu "LCD GPIO Configuration"
+        config SPI_LCD_CS_PIN
+            int "SPI Chip Select Pin (CS)"
+            default 6
+            help
+                Set the GPIO pin for SPI Chip Select (CS).
+
+        config SPI_LCD_DC_PIN
+            int "Data/Command Pin (DC)"
+            default 4
+            help
+                Set the GPIO pin for the Data/Command (DC) pin for the LCD.
+
+        config SPI_LCD_RST_PIN
+            int "Reset Pin (RST)"
+            default -1
+            help
+                Set the GPIO pin for the Reset (RST) pin of the LCD (optional).
+
+        config SPI_LCD_TE_PIN
+            int "Tearing effect Pin (TE)"
+            default -1
+            help
+                Set the GPIO pin for the Tearing effect (RST) pin of the LCD (optional).
+
+        config SPI_LCD_BL_PIN
+            int "Backlight Pin (BL)"
+            default 3
+            help
+                Set the GPIO pin for the LCD backlight control (optional).
+    endmenu
+
+    menu "SPI GPIO Configuration"
+        config SPI_SCK_PIN
+            int "SPI Clock Pin (SCK)"
+            default 7
+            help
+                Set the GPIO pin for SPI clock (SCK).
+
+        config SPI_MISO_PIN
+            int "SPI MISO Pin"
+            default 15
+            help
+                Set the GPIO pin for SPI MISO (optional, can be left as -1 if not used).
+
+        config SPI_MOSI_PIN
+            int "SPI MOSI Pin"
+            default 5
+            help
+                Set the GPIO pin for SPI MOSI (Master Out Slave In).
+    endmenu
+
+    menu "IIC GPIO Configuration"
+        config I2C0_SDA_PIN
+            int "I2C0 SDA Pin"
+            default 8
+            help
+                Set the GPIO pin for I2C0 SDA.
+
+        config I2C0_SCL_PIN
+            int "I2C0 SCL Pin"
+            default 18
+            help
+                Set the GPIO pin for I2C0 SCL.
+
+        config I2C1_SDA_PIN
+            int "I2C1 SDA Pin"
+            default -1
+            help
+                Set the GPIO pin for I2C1 SDA.
+
+        config I2C1_SCL_PIN
+            int "I2C1 SCL Pin"
+            default -1
+            help
+                Set the GPIO pin for I2C1 SCL.
+    endmenu
+
+    config SPISD_CS_PIN
+        int "SPISD CS Pin"
+        default 16
+        help
+            Set the GPIO pin for SPISD Chip Select.
+
+    config TOUCH_INT_PIN
+        int "Touch int Pin"
+        default 17
+        help
+            Set the GPIO pin for the interrupt pin for lcd touch.
+
+endmenu

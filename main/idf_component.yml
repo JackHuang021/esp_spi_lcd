@@ -1,7 +1,10 @@
 ## IDF Component Manager Manifest File
 dependencies:
+  espressif/freetype: "^2.13.3"
+  joltwallet/littlefs: "==1.16.1"
+  espressif/esp_lcd_touch_ft5x06: "^1.0.6~1"
   espressif/console_cmd_wifi: "^1.1.0"
-  lvgl/lvgl: "~8.3.0"
+  lvgl/lvgl: "^9.2.2"
   ## Required IDF version
   idf:
     version: ">=4.1.0"

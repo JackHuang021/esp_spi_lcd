@@ -18,7 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "inttypes.h"
-#include "iic.h"
+#include "i2c_new.h"
 
 // xl9555 int gpio define
 #define XL9555_INT_MODE			0

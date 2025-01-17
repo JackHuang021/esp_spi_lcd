@@ -1,19 +1,24 @@
 set(src_dirs
-            iic
+            i2c
             xl9555
-            lcd)
+            lcd
+            spi)
 
 set(include_dirs
-            iic
+            i2c
             xl9555
-            lcd)
+            lcd
+            spi)
 
 set(requires
             driver
             esp_lcd
-            lvgl)
+            lvgl
+            esp_lcd_touch_ft5x06)
 
-idf_component_register(SRC_DIRS ${src_dirs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
+idf_component_register(SRC_DIRS ${src_dirs}
+                       INCLUDE_DIRS ${include_dirs} 
+                       REQUIRES ${requires})
 
 component_compile_options(-ffast-math -O3 -Wno-error=format=-Wno-format)
 

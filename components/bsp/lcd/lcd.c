@@ -1,196 +1,514 @@
 /**
  * @file lcd.c
- * @author Jack
+ * @author Jack Huang (jackhuang021@gmail.com)
  * @brief 
  * @version 0.1
- * @date 2024-11-23
+ * @date 2025-01-16
  * 
- * @copyright Copyright (c) 2024
+ * @copyright Copyright (c) 2025
  * 
  */
 
-#include "lcd.h"
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_interface.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_err.h"
+#include "esp_check.h"
+#include "esp_log.h"
 #include "lvgl.h"
-
-#define LCD_PIXEL_CLOCK_HZ			(20 * 1000 * 1000)
-#define LCD_BK_LIGHT_ON_LEVEL		1
-#define LCD_BK_LIGHT_OFF_LEVEL		!LCD_BK_LIGHT_ON_LEVEL
-#define LCD_PIN_NUM_SCLK			GPIO_NUM_12
-#define LCD_PIN_NUM_MOSI			GPIO_NUM_11
-#define LCD_PIN_NUM_MISO			GPIO_NUM_13
-#define LCD_PIN_NUM_DC				GPIO_NUM_40
-#define LCD_PIN_NUM_RST				-1
-#define LCD_PIN_NUM_CS				GPIO_NUM_21
-#define LCD_PIN_NUM_BK_LIGHT		-1
-#define LCD_PIN_NUM_TOUCH_CS		-1
-
-#define LCD_H_RES					240
-#define LCD_V_RES					320
-
-#define LCD_CMD_BITS				8
-#define LCD_PARAM_BITS				8
-
-#define LVGL_TICK_PERIOD_MS			2
-#define LVGL_TASK_MAX_DELAY_MS		500
-#define LVGL_TASK_MIN_DELAY_MS		1
-#define LVGL_TASK_STACK_SIZE		(4 * 1024)
-#define LVGL_TASK_PRIORITY			2
+#include "esp_lcd_panel_st7789.h"
+#include "lcd.h"
+#include "esp_lcd_touch_ft5x06.h"
+#include "lv_demos.h"
+#include "sdkconfig.h"
 
 static const char *tag = "lcd";
 
-static lv_disp_draw_buf_t disp_buf;
-static lv_disp_drv_t disp_drv;
-static SemaphoreHandle_t lvgl_mux = NULL;
+struct display_ctx {
+    esp_lcd_panel_io_handle_t panel_io_handle;
+    esp_lcd_panel_io_handle_t tp_io_handle;
+    esp_lcd_panel_handle_t panel_handle;
+    esp_lcd_touch_handle_t tp_handle;
+    lv_disp_t *lv_disp;
+    lv_indev_t *lv_indev;
+    esp_timer_handle_t lvgl_timer;
 
-static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+
+    uint32_t trans_size;
+    uint8_t *frame_buffer;
+    uint8_t *trans_buf;
+    uint8_t bpp;
+    SemaphoreHandle_t trans_done_sem;
+
+    uint32_t lvgl_timer_period_ms;
+    uint32_t lvgl_task_max_delay_ms;
+    uint32_t lvgl_task_min_delay_ms;
+
+    gpio_num_t te_gpio_num;
+
+    SemaphoreHandle_t lvgl_mux;
+    SemaphoreHandle_t te_v_sync_sem;
+    SemaphoreHandle_t te_catch_sem;
+
+    bool lvgl_running;
+};
+
+/* display context */
+static struct display_ctx *disp_ctx =  NULL;
+
+/**
+ * @brief TE interrupt handle
+ * 
+ * @param arg point to display context
+ */
+static void IRAM_ATTR display_tear_interrupt(void *arg)
 {
-	esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data;
-	int offset_x1 = area->x1;
-	int offset_x2 = area->x2;
-	int offset_y1 = area->y1;
-	int offset_y2 = area->y2;
+    assert(arg);
+    struct display_ctx *disp_ctx = (struct display_ctx *)arg;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-	esp_lcd_panel_draw_bitmap(panel_handle, offset_x1, offset_y1,
-							  offset_x2, offset_y2, color_map);
+    if (disp_ctx->te_v_sync_sem) {
+        /* send vsync semphore */
+        xSemaphoreGiveFromISR(disp_ctx->te_v_sync_sem, &xHigherPriorityTaskWoken);
+
+        if (xHigherPriorityTaskWoken)
+            portYIELD_FROM_ISR();
+    }
+    gpio_isr_handler_remove(disp_ctx->te_gpio_num);
 }
 
-static void lvgl_drv_update_cb(lv_disp_drv_t *drv)
+/**
+ * @brief notify lvgl do next flush when last flush finished
+ * 
+ * @param panel_io lcd panel io pointer
+ * @param edata Panel IO event data
+ * @param user_ctx lv_disp_drv_t pointer
+ * @return true a high priority task has been waken up by this function
+ */
+static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io,
+                                    esp_lcd_panel_io_event_data_t *edata,
+                                    void *user_ctx)
 {
-	esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data;
+    BaseType_t task_awake = pdFALSE;
+    struct display_ctx *display_ctx = (struct display_ctx *)user_ctx;
 
-	switch ( drv->rotated)
-	{
-	case LV_DISP_ROT_NONE:
-		esp_lcd_panel_swap_xy(panel_handle, false);
-		esp_lcd_panel_mirror(panel_handle, true, false);
-		break;
+    xSemaphoreGiveFromISR(display_ctx->trans_done_sem, &task_awake);
 
-	case LV_DISP_ROT_90:
-		esp_lcd_panel_swap_xy(panel_handle, true);
-		esp_lcd_panel_mirror(panel_handle, true, true);
-		break;
-
-	case LV_DISP_ROT_180:
-		esp_lcd_panel_swap_xy(panel_handle, false);
-		esp_lcd_panel_mirror(panel_handle, false, true);
-		break;
-
-	case LV_DISP_ROT_270:
-		esp_lcd_panel_swap_xy(panel_handle, true);
-		esp_lcd_panel_mirror(panel_handle, false, false);
-		break;
-
-	default:
-		break;
-	}
+    return false;
 }
 
-static void lvgl_tick_increase(void *arg)
+/**
+ * @brief lvgl callback to flush screen
+ * 
+ * @param drv point to lvgl display object
+ * @param area flush area size
+ * @param color_map color data
+ */
+static void lvgl_flush_callback(lv_display_t *disp, const lv_area_t *area,
+                                uint8_t *px_map)
 {
-	lv_tick_inc(LVGL_TICK_PERIOD_MS);
+    assert(disp != NULL);
+    struct display_ctx *disp_ctx =
+                    (struct display_ctx * )lv_display_get_driver_data(disp);
+    assert(disp_ctx != NULL);
+
+    uint8_t *from = px_map;
+    uint8_t *to = NULL;
+    const int x_start = area->x1;
+    const int x_end = area->x2;
+    const int y_start = area->y1;
+    const int y_end = area->y2;
+    const int width = x_end - x_start + 1;
+    const int height = y_end - y_start + 1;
+
+    /* t1 t2 used to calcu flush time */
+    int64_t t1 = 0;
+    int64_t t2 = 0;
+
+    int trans_height = disp_ctx->trans_size / disp_ctx->bpp / width;
+    int trans_count = height / trans_height;
+    int y_start_tmp = 0;
+    int y_end_tmp = 0;
+    to = disp_ctx->trans_buf;
+
+    /* split serveral times DMA transfer */
+    for (int i = 0; i < trans_count; i++) {
+        if (i == 0) {
+            /* enable TE interrupt, and wait next TE singal */
+            gpio_isr_handler_add(GPIO_NUM_2, display_tear_interrupt, disp_ctx);
+            xSemaphoreTake(disp_ctx->te_v_sync_sem, portMAX_DELAY);
+            /* the first transfer do not wait trans done semphore */
+            xSemaphoreGive(disp_ctx->trans_done_sem);
+            t1 = esp_timer_get_time();
+        }
+        /* wait last transfer done */
+        xSemaphoreTake(disp_ctx->trans_done_sem, portMAX_DELAY);
+        memcpy(to, from + i * trans_height * width * disp_ctx->bpp,
+               trans_height * width * disp_ctx->bpp);
+        y_start_tmp = i * trans_height;
+        y_end_tmp = i * trans_height + trans_height;
+        esp_lcd_panel_draw_bitmap(disp_ctx->panel_handle, x_start, y_start_tmp,
+                                  x_end + 1, y_end_tmp, to);
+    }
+
+    t2 = esp_timer_get_time();
+    /* notify lvgl for next render */
+    lv_disp_flush_ready(disp);
+
+    ESP_LOGD(tag, "t: %lld uS",t2 - t1);
 }
 
-static void lvgl_port_task(void *args)
+/**
+ * @brief timer callback to increase lvgl tick
+ * 
+ * @param arg point to display context
+ */
+static void lvgl_tick_increment(void *arg)
 {
-	ESP_LOGI(tag, "start lvgl task");
-	uint32_t task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
+    struct display_ctx *disp_ctx = (struct display_ctx *)arg;
 
-	while (1) {
-		if ()
-	}
+    /* Tell LVGL how many milliseconds has elapsed */
+    lv_tick_inc(disp_ctx->lvgl_timer_period_ms);
 }
 
-esp_err_t lcd_init(void)
+/**
+ * @brief lock lvgl
+ * 
+ * @param timeout_ms timeout time
+ * @return true lock lvgl success
+ * @return false fail to lock lvgl
+ */
+bool lvgl_lock(int timeout_ms)
 {
-	esp_err_t ret = ESP_OK;
-	spi_bus_config_t spi_bus_cfg = {0};
-	esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
-	esp_lcd_panel_io_spi_config_t lcd_io_config;
-	esp_lcd_panel_handle_t panel_handle = NULL;
-	esp_lcd_panel_dev_config_t panel_config;
-	lv_color_t *buf1 = NULL;
-	lv_color_t *buf2 = NULL;
-	lv_disp_t *disp = NULL;
-	const esp_timer_create_args_t lvgl_tick_timer_args = {
-		.callback = lvgl_tick_increase,
-		.name = "lvgl_tick",
-	};
-	esp_timer_handle_t lvgl_tick_timer = NULL;
-
-	ESP_LOGI(tag, "init SPI bus");
-
-	spi_bus_cfg.sclk_io_num = LCD_PIN_NUM_SCLK;
-	spi_bus_cfg.mosi_io_num = LCD_PIN_NUM_MOSI;
-	spi_bus_cfg.miso_io_num = LCD_PIN_NUM_MISO;
-	spi_bus_cfg.quadhd_io_num = -1;
-	spi_bus_cfg.quadwp_io_num = -1;
-	spi_bus_cfg.max_transfer_sz = 0;
-	ret = spi_bus_initialize(SPI2_HOST, &spi_bus_cfg, SPI_DMA_CH_AUTO);
-	ESP_ERROR_CHECK(ret);
-
-	ESP_LOGI(tag, "init lcd panel");
-	lcd_io_config.dc_gpio_num = LCD_PIN_NUM_DC;
-	lcd_io_config.cs_gpio_num = LCD_PIN_NUM_CS;
-	lcd_io_config.pclk_hz = LCD_PIXEL_CLOCK_HZ;
-	lcd_io_config.lcd_cmd_bits = LCD_CMD_BITS;
-	lcd_io_config.lcd_param_bits = LCD_PARAM_BITS;
-	lcd_io_config.spi_mode = 0;
-	lcd_io_config.trans_queue_depth = 10;
-	lcd_io_config.on_color_trans_done = NULL;
-	lcd_io_config.user_ctx = NULL;
-
-	// attach lcd to the SPI bus
-	ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &lcd_io_config, &lcd_io_handle));
-
-	panel_config.reset_gpio_num = LCD_PIN_NUM_RST;
-	panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
-	panel_config.bits_per_pixel = 16;
-
-	ESP_LOGI(tag, "install st7789 panel driver");
-	ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &panel_handle));
-
-	ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-	ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-	ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
-	ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-
-	ESP_LOGI(tag, "init lvgl library");
-	lv_init();
-	buf1 = heap_caps_malloc(LCD_H_RES * 20 * sizeof(lv_color_t), MALLOC_CAP_DMA);
-	assert(buf1);
-	buf2 = heap_caps_malloc(LCD_H_RES * 20 * sizeof(lv_color_t), MALLOC_CAP_DMA);
-	assert(buf2);
-
-	lv_disp_draw_buf_init(&disp_buf, buf1, buf2, LCD_H_RES * 20);
-
-	ESP_LOGI(tag, "register display driver to lvgl");
-	lv_disp_drv_init(&disp_drv);
-	disp_drv.hor_res = LCD_H_RES;
-	disp_drv.ver_res = LCD_V_RES;
-	disp_drv.flush_cb = lvgl_flush_cb;
-	disp_drv.drv_update_cb = lvgl_drv_update_cb;
-	disp_drv.draw_buf = &disp_buf;
-	disp_drv.user_data = panel_handle;
-	disp = lv_disp_drv_register(&disp_drv);
-
-	ESP_LOGI(tag, "install lvgl tick timer");
-	ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
-	ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, LVGL_TICK_PERIOD_MS * 1000));
-
-	lvgl_mux = xSemaphoreCreateRecursiveMutex();
-	assert(lvgl_mux);
-	ESP_LOGI(tag, "create lvgl task");
-	xTaskCreate()
-
-	
-
-
-	
-
-
-	
-	return ret;
+    // Convert timeout in milliseconds to FreeRTOS ticks
+    // If `timeout_ms` is set to -1, the program will block until the condition is met
+    const TickType_t timeout_ticks =
+                (timeout_ms == -1) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    return (xSemaphoreTakeRecursive(disp_ctx->lvgl_mux, timeout_ticks) == pdTRUE);
 }
 
+/**
+ * @brief unlock lvgl
+ * 
+ */
+void lvgl_unlock(void)
+{
+    xSemaphoreGiveRecursive(disp_ctx->lvgl_mux);
+}
 
+/**
+ * @brief lvgl task
+ * 
+ * @param arg not used
+ */
+static void lvgl_port_task(void *arg)
+{
+    struct display_ctx *disp_ctx = (struct display_ctx *)arg;
+    uint32_t task_delay_ms = disp_ctx->lvgl_task_max_delay_ms;
 
+    ESP_LOGI(tag, "start lvgl task");
+    disp_ctx->lvgl_running = true;
+    while (disp_ctx->lvgl_running) {
+        // Lock the mutex due to the LVGL APIs are not thread-safe
+        if (lvgl_lock(-1)) {
+            task_delay_ms = lv_timer_handler();
+            // Release the mutex
+            lvgl_unlock();
+        }
+        if (task_delay_ms > disp_ctx->lvgl_task_max_delay_ms) {
+            task_delay_ms = disp_ctx->lvgl_task_max_delay_ms;
+        } else if (task_delay_ms < disp_ctx->lvgl_task_min_delay_ms) {
+            task_delay_ms = disp_ctx->lvgl_task_min_delay_ms;
+        }
+        vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
+    }
+
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief update touch data
+ * 
+ * @param indev point to input device
+ * @param data point to input data
+ */
+static void lvgl_touch_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    uint16_t touchpad_x[1] = {0};
+    uint16_t touchpad_y[1] = {0};
+    uint8_t touchpad_cnt = 0;
+    esp_lcd_touch_handle_t tp_handle =
+                        (esp_lcd_touch_handle_t)lv_indev_get_driver_data(indev);
+
+    /* Read touch controller data */
+    esp_lcd_touch_read_data(tp_handle);
+
+    /* Get coordinates */
+    bool touchpad_pressed = esp_lcd_touch_get_coordinates(tp_handle, touchpad_x,
+                                        touchpad_y, NULL, &touchpad_cnt, 1);
+
+    if (touchpad_pressed && touchpad_cnt > 0) {
+        data->point.x = touchpad_x[0];
+        data->point.y = touchpad_y[0];
+        data->state = LV_INDEV_STATE_PRESSED;
+        ESP_LOGD(tag, "x: %ld, y: %ld", data->point.x, data->point.y);
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+/**
+ * @brief lcd & lvgl init
+ * 
+ * @param disp_cfg point to display config parameters
+ * @return esp_err_t 
+ */
+esp_err_t lcd_init(struct display_config *disp_cfg)
+{
+    esp_err_t ret = ESP_OK;
+
+    disp_ctx = malloc(sizeof(struct display_ctx));
+    ESP_GOTO_ON_FALSE(disp_ctx, ESP_ERR_NO_MEM, err, tag,
+                      "not enough memory for lvgl context allocation");
+
+    disp_ctx->lvgl_timer_period_ms = disp_cfg->lvgl_cfg.timer_period_ms;
+    disp_ctx->lvgl_task_min_delay_ms = disp_cfg->lvgl_cfg.task_min_delay_ms;
+    disp_ctx->lvgl_task_max_delay_ms = disp_cfg->lvgl_cfg.task_max_delay_ms;
+    disp_ctx->te_gpio_num = disp_cfg->te_gpio_num;
+    disp_ctx->bpp = LV_COLOR_DEPTH / 8;
+    disp_ctx->trans_size = disp_cfg->trans_size;
+
+    /* lcd vsync sem */
+    disp_ctx->te_v_sync_sem = xSemaphoreCreateBinary();
+    ESP_GOTO_ON_FALSE(disp_ctx->te_v_sync_sem, ESP_ERR_NO_MEM, err, tag,
+                      "failed to create te sync semaphore");
+
+    /* spi data transfer done sem */
+    disp_ctx->trans_done_sem = xSemaphoreCreateBinary();
+    ESP_GOTO_ON_FALSE(disp_ctx->trans_done_sem, ESP_ERR_NO_MEM, err, tag,
+                      "failed to create te sync semaphore");
+
+    /* ready to catch te signal sem */
+    disp_ctx->te_catch_sem = xSemaphoreCreateBinary();
+    ESP_GOTO_ON_FALSE(disp_ctx->te_catch_sem, ESP_ERR_NO_MEM, err, tag,
+                      "failed to create te sync semaphore");
+
+    /* init lcd backlight io */
+    ESP_LOGI(tag, "turn off lcd backlight");
+    gpio_config_t lcd_bl_gpio_config = {
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = 1ULL << disp_cfg->bl_gpio_num,
+    };
+    ESP_GOTO_ON_ERROR(gpio_config(&lcd_bl_gpio_config), err, tag,
+                      "te gpio config failed");
+    gpio_set_level(disp_cfg->bl_gpio_num, 1);
+
+    /* init lcd */
+    ESP_LOGI(tag, "install lcd panel IO");
+    esp_lcd_panel_io_handle_t panel_io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = disp_cfg->dc_gpio_num,
+        .cs_gpio_num = disp_cfg->cs_gpio_num,
+        .pclk_hz = disp_cfg->pclk_hz,
+        .lcd_cmd_bits = disp_cfg->lcd_cmd_bits,
+        .lcd_param_bits = disp_cfg->lcd_param_bits,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+        .on_color_trans_done = notify_lvgl_flush_ready,
+        .user_ctx = disp_ctx,
+    };
+
+    /* Attach the LCD to the SPI bus */
+    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)disp_cfg->spi_host,
+                                   &io_config, &panel_io_handle);
+    ESP_GOTO_ON_ERROR(ret, err, tag, "failed to attach lcd to spi bus");
+
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = disp_cfg->rst_gpio_num,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+        .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
+    };
+
+    ESP_LOGI(tag, "install ST7789 panel driver");
+    ret = esp_lcd_new_panel_st7789(panel_io_handle, &panel_config,
+                                   &disp_ctx->panel_handle);
+    ESP_GOTO_ON_ERROR(ret, err, tag, "insatll lcd panel driver failed");
+
+    esp_lcd_panel_reset(disp_ctx->panel_handle);
+    esp_lcd_panel_init(disp_ctx->panel_handle);
+    esp_lcd_panel_invert_color(disp_ctx->panel_handle, true);
+    esp_lcd_panel_swap_xy(disp_ctx->panel_handle, false);
+    esp_lcd_panel_mirror(disp_ctx->panel_handle, false, false);
+
+    if (disp_cfg->te_gpio_num) {
+        disp_cfg->tear_intr_type = GPIO_INTR_NEGEDGE;
+
+        const gpio_config_t te_gpio_config = {
+            .intr_type = disp_cfg->tear_intr_type,
+            .mode = GPIO_MODE_INPUT,
+            .pin_bit_mask = BIT64(disp_cfg->te_gpio_num),
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+        };
+        gpio_config(&te_gpio_config);
+        gpio_install_isr_service(ESP_INTR_FLAG_EDGE);
+    }
+
+    /* consider to turn on lcd after lvgl first flash cb */
+    esp_lcd_panel_disp_on_off(disp_ctx->panel_handle, true);
+
+    esp_lcd_panel_io_i2c_config_t tp_io_config =
+                                    ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG();
+    tp_io_config.scl_speed_hz = 400000;
+    esp_lcd_touch_config_t tp_config = {
+        .x_max = disp_cfg->hres,
+        .y_max = disp_cfg->vres,
+        .rst_gpio_num = -1,
+        .int_gpio_num = -1,
+#if CONFIG_LCD_DAXIAN_2_0
+        .flags = {
+            .swap_xy = 1,
+            .mirror_x = 1,
+            .mirror_y = 0,
+        },
+#elif CONFIG_LCD_DAXIAN_2_4
+        .flags = {
+            .swap_xy = 0,
+            .mirror_x = 1,
+            .mirror_y = 0,
+        },
+#endif
+    };
+    ret = esp_lcd_new_panel_io_i2c_v2(disp_cfg->i2c->bus_handle,
+                                      &tp_io_config, &disp_ctx->tp_io_handle);
+    ESP_GOTO_ON_ERROR(ret, err, tag, "failed to init i2c panel io");
+    
+
+    ESP_LOGI(tag, "init touch controller ft6336\n");
+    ret = esp_lcd_touch_new_i2c_ft5x06(disp_ctx->tp_io_handle, &tp_config,
+                                       &disp_ctx->tp_handle);
+    ESP_GOTO_ON_ERROR(ret, err, tag, "failed to init ft6336");
+
+    ESP_LOGI(tag, "init lvgl library");
+    lv_init();
+
+    /* memory for lvgl render */
+    disp_ctx->frame_buffer = heap_caps_malloc(disp_cfg->frame_buffer_size,
+                                                 MALLOC_CAP_SPIRAM);
+    ESP_GOTO_ON_FALSE(disp_ctx->frame_buffer, ESP_ERR_NO_MEM, err, tag,
+                      "not enough memory for frame buffer allocation");
+
+    /* memory for DMA trans */
+    disp_ctx->trans_buf = heap_caps_malloc(disp_cfg->trans_size,
+                                              MALLOC_CAP_DMA);
+    ESP_GOTO_ON_FALSE(disp_ctx->trans_buf, ESP_ERR_NO_MEM, err, tag,
+                      "not enough memory for buf1 allocation");
+
+    disp_ctx->lv_disp = lv_display_create(disp_cfg->hres, disp_cfg->vres);
+    ESP_GOTO_ON_FALSE(disp_ctx->lv_disp, ESP_ERR_NO_MEM, err, tag,
+                      "not enough memory for lv_disp_t");
+
+    lv_display_set_color_format(disp_ctx->lv_disp, disp_cfg->color_format);
+    lv_display_set_buffers(disp_ctx->lv_disp, disp_ctx->frame_buffer, NULL,
+                           disp_cfg->frame_buffer_size,
+                           LV_DISP_RENDER_MODE_FULL);
+    lv_display_set_flush_cb(disp_ctx->lv_disp, lvgl_flush_callback);
+    lv_display_set_driver_data(disp_ctx->lv_disp, disp_ctx);
+
+    ESP_LOGI(tag, "install lvgl tick timer");
+    /* lvgl timer, add 2ms for lvgl tick each timer interrupt */
+    const esp_timer_create_args_t lvgl_tick_timer_args = {
+        .callback = &lvgl_tick_increment,
+        .name = "lvgl_tick",
+        .arg = disp_ctx,
+    };
+
+    ret = esp_timer_create(&lvgl_tick_timer_args, &disp_ctx->lvgl_timer);
+    ESP_GOTO_ON_ERROR(ret, err, tag, "create lvgl timer failed");
+    ret = esp_timer_start_periodic(disp_ctx->lvgl_timer,
+                                   disp_cfg->lvgl_cfg.timer_period_ms * 1000);
+    ESP_GOTO_ON_ERROR(ret, err, tag, "start lvgl timer failed");
+
+    ESP_LOGI(tag, "register lvgl input device");
+    disp_ctx->lv_indev = lv_indev_create();
+    ESP_GOTO_ON_FALSE(disp_ctx->lv_indev, ESP_ERR_NO_MEM, err, tag,
+                      "not enough memory for lv_indev_t");
+
+    lv_indev_set_type(disp_ctx->lv_indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(disp_ctx->lv_indev, lvgl_touch_cb);
+    lv_indev_set_disp(disp_ctx->lv_indev, disp_ctx->lv_disp);
+    lv_indev_set_driver_data(disp_ctx->lv_indev, disp_ctx->tp_handle);
+
+    disp_ctx->lvgl_mux = xSemaphoreCreateRecursiveMutex();
+    ESP_GOTO_ON_FALSE(disp_ctx->lvgl_mux, ESP_ERR_NO_MEM, err, tag,
+                      "create lvgl mutex fail");
+
+    ESP_LOGI(tag, "create lvgl task");
+    BaseType_t res = 0;
+    res = xTaskCreate(lvgl_port_task, "lvgl", disp_cfg->lvgl_cfg.task_stack,
+                      disp_ctx, disp_cfg->lvgl_cfg.task_priority, NULL);
+    ESP_GOTO_ON_FALSE(res, ESP_FAIL, err, tag, "create lvgl task failed");
+    ESP_LOGI(tag, "turn on lcd backlight");
+    gpio_set_level(disp_cfg->bl_gpio_num, 0);
+
+err:
+    if (ret != ESP_OK) {
+
+        if (disp_ctx->lvgl_mux)
+            vSemaphoreDelete(disp_ctx->lvgl_mux);
+
+        if (disp_ctx->te_catch_sem)
+            vSemaphoreDelete(disp_ctx->te_catch_sem);
+
+        if (disp_ctx->te_v_sync_sem)
+            vSemaphoreDelete(disp_ctx->te_v_sync_sem);
+
+        if (disp_ctx->trans_done_sem)
+            vSemaphoreDelete(disp_ctx->trans_done_sem);
+
+        if (disp_ctx->panel_handle)
+            esp_lcd_panel_del(disp_ctx->panel_handle);
+
+        if (disp_ctx->panel_io_handle)
+            esp_lcd_panel_io_del(disp_ctx->panel_io_handle);
+
+        if (disp_ctx->tp_io_handle)
+            esp_lcd_panel_io_del(disp_ctx->tp_io_handle);
+
+        if (disp_ctx->tp_handle)
+            esp_lcd_touch_del(disp_ctx->tp_handle);
+
+        if (disp_ctx->lv_disp)
+            lv_display_delete(disp_ctx->lv_disp);
+
+        if (disp_ctx->frame_buffer)
+            free(disp_ctx->frame_buffer);
+
+        if (disp_ctx->trans_buf)
+            free(disp_ctx->trans_buf);
+
+        if (disp_ctx->lvgl_timer) {
+            esp_timer_stop(disp_ctx->lvgl_timer);
+            esp_timer_delete(disp_ctx->lvgl_timer);
+            disp_ctx->lvgl_timer = NULL;
+        }
+
+        if (disp_ctx->lv_indev)
+            lv_indev_delete(disp_ctx->lv_indev);
+
+        if (disp_ctx)
+            free(disp_ctx);
+    }
+
+    return ret;
+}
