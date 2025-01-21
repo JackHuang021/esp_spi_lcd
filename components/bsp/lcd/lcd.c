@@ -28,6 +28,7 @@
 #include "esp_lcd_panel_st7789.h"
 #include "lcd.h"
 #include "esp_lcd_touch_ft5x06.h"
+#include "esp_lcd_panel_commands.h"
 #include "lv_demos.h"
 #include "sdkconfig.h"
 
@@ -98,21 +99,13 @@ static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io,
                                     esp_lcd_panel_io_event_data_t *edata,
                                     void *user_ctx)
 {
-    BaseType_t task_awake = pdFALSE;
-    struct display_ctx *display_ctx = (struct display_ctx *)user_ctx;
+    struct display_ctx *disp_ctx = (struct display_ctx *)user_ctx;
 
-    xSemaphoreGiveFromISR(display_ctx->trans_done_sem, &task_awake);
+    lv_disp_flush_ready(disp_ctx->lv_disp);
 
     return false;
 }
 
-/**
- * @brief lvgl callback to flush screen
- * 
- * @param drv point to lvgl display object
- * @param area flush area size
- * @param color_map color data
- */
 static void lvgl_flush_callback(lv_display_t *disp, const lv_area_t *area,
                                 uint8_t *px_map)
 {
@@ -121,50 +114,23 @@ static void lvgl_flush_callback(lv_display_t *disp, const lv_area_t *area,
                     (struct display_ctx * )lv_display_get_driver_data(disp);
     assert(disp_ctx != NULL);
 
-    uint8_t *from = px_map;
-    uint8_t *to = NULL;
     const int x_start = area->x1;
     const int x_end = area->x2;
     const int y_start = area->y1;
     const int y_end = area->y2;
-    const int width = x_end - x_start + 1;
-    const int height = y_end - y_start + 1;
+    static uint8_t set_te_scanline_val[2];
+    uint16_t scanline_val_tmp = (y_end - y_start + 1) / 2 + y_start;
+    set_te_scanline_val[0] = scanline_val_tmp & 0xFF;
+    set_te_scanline_val[1] = scanline_val_tmp >> 8;
 
-    /* t1 t2 used to calcu flush time */
-    int64_t t1 = 0;
-    int64_t t2 = 0;
-
-    int trans_height = disp_ctx->trans_size / disp_ctx->bpp / width;
-    int trans_count = height / trans_height;
-    int y_start_tmp = 0;
-    int y_end_tmp = 0;
-    to = disp_ctx->trans_buf;
-
-    /* split serveral times DMA transfer */
-    for (int i = 0; i < trans_count; i++) {
-        if (i == 0) {
-            /* enable TE interrupt, and wait next TE singal */
-            gpio_isr_handler_add(GPIO_NUM_2, display_tear_interrupt, disp_ctx);
-            xSemaphoreTake(disp_ctx->te_v_sync_sem, portMAX_DELAY);
-            /* the first transfer do not wait trans done semphore */
-            xSemaphoreGive(disp_ctx->trans_done_sem);
-            t1 = esp_timer_get_time();
-        }
-        /* wait last transfer done */
-        xSemaphoreTake(disp_ctx->trans_done_sem, portMAX_DELAY);
-        memcpy(to, from + i * trans_height * width * disp_ctx->bpp,
-               trans_height * width * disp_ctx->bpp);
-        y_start_tmp = i * trans_height;
-        y_end_tmp = i * trans_height + trans_height;
-        esp_lcd_panel_draw_bitmap(disp_ctx->panel_handle, x_start, y_start_tmp,
-                                  x_end + 1, y_end_tmp, to);
-    }
-
-    t2 = esp_timer_get_time();
-    /* notify lvgl for next render */
-    lv_disp_flush_ready(disp);
-
-    ESP_LOGD(tag, "t: %lld uS",t2 - t1);
+    // set te interrupt line
+    esp_lcd_panel_io_tx_param(disp_ctx->panel_io_handle, LCD_CMD_STE,
+                              (uint8_t[]) {set_te_scanline_val[0], set_te_scanline_val[1]}, 2);
+    gpio_isr_handler_add(GPIO_NUM_2, display_tear_interrupt, disp_ctx);
+    // wait te sem
+    xSemaphoreTake(disp_ctx->te_v_sync_sem, portMAX_DELAY);
+    esp_lcd_panel_draw_bitmap(disp_ctx->panel_handle, x_start, y_start,
+                                    x_end + 1, y_end + 1, px_map);
 }
 
 /**
@@ -331,6 +297,7 @@ esp_err_t lcd_init(struct display_config *disp_cfg)
     ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)disp_cfg->spi_host,
                                    &io_config, &panel_io_handle);
     ESP_GOTO_ON_ERROR(ret, err, tag, "failed to attach lcd to spi bus");
+    disp_ctx->panel_io_handle = panel_io_handle;
 
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = disp_cfg->rst_gpio_num,
@@ -404,15 +371,15 @@ esp_err_t lcd_init(struct display_config *disp_cfg)
 
     /* memory for lvgl render */
     disp_ctx->frame_buffer = heap_caps_malloc(disp_cfg->frame_buffer_size,
-                                                 MALLOC_CAP_SPIRAM);
+                                                 MALLOC_CAP_DMA);
     ESP_GOTO_ON_FALSE(disp_ctx->frame_buffer, ESP_ERR_NO_MEM, err, tag,
                       "not enough memory for frame buffer allocation");
 
-    /* memory for DMA trans */
-    disp_ctx->trans_buf = heap_caps_malloc(disp_cfg->trans_size,
-                                              MALLOC_CAP_DMA);
-    ESP_GOTO_ON_FALSE(disp_ctx->trans_buf, ESP_ERR_NO_MEM, err, tag,
-                      "not enough memory for buf1 allocation");
+    // /* memory for DMA trans */
+    // disp_ctx->trans_buf = heap_caps_malloc(disp_cfg->trans_size,
+    //                                           MALLOC_CAP_DMA);
+    // ESP_GOTO_ON_FALSE(disp_ctx->trans_buf, ESP_ERR_NO_MEM, err, tag,
+    //                   "not enough memory for buf1 allocation");
 
     disp_ctx->lv_disp = lv_display_create(disp_cfg->hres, disp_cfg->vres);
     ESP_GOTO_ON_FALSE(disp_ctx->lv_disp, ESP_ERR_NO_MEM, err, tag,
@@ -421,7 +388,7 @@ esp_err_t lcd_init(struct display_config *disp_cfg)
     lv_display_set_color_format(disp_ctx->lv_disp, disp_cfg->color_format);
     lv_display_set_buffers(disp_ctx->lv_disp, disp_ctx->frame_buffer, NULL,
                            disp_cfg->frame_buffer_size,
-                           LV_DISP_RENDER_MODE_FULL);
+                           LV_DISP_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(disp_ctx->lv_disp, lvgl_flush_callback);
     lv_display_set_driver_data(disp_ctx->lv_disp, disp_ctx);
 

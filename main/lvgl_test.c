@@ -79,19 +79,19 @@ static void lvgl_test_task(void *arg)
     int64_t t1 = 0;
     int64_t t2 = 0;
 
-    lvgl_lock(-1);
-    t1 = esp_timer_get_time();
-    lv_example_freetype_1();
-    t2 = esp_timer_get_time();
-    ESP_LOGI(tag, "t: %lld uS",t2 - t1);
-    lvgl_unlock();
+    // lvgl_lock(-1);
+    // t1 = esp_timer_get_time();
+    // lv_example_freetype_1();
+    // t2 = esp_timer_get_time();
+    // ESP_LOGI(tag, "t: %lld uS",t2 - t1);
+    // lvgl_unlock();
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(50));
         lvgl_lock(-1);
         lv_obj_t *active_screen = lv_scr_act();
         lv_obj_set_style_bg_color(active_screen, lv_color_hex(colors[color_index]), 0);
-        lv_label_set_text(label, strs[color_index]);
+        // lv_label_set_text(label, strs[color_index]);
         lvgl_unlock();
         color_index = (color_index + 1) % 3;
     }

@@ -157,7 +157,7 @@ void app_main(void)
         .hres = 240,
         .vres = 320,
         .pclk_hz = 80 * 1000 * 1000,
-        .frame_buffer_size = 240 * 320 * LV_COLOR_DEPTH / 8,
+        .frame_buffer_size = 240 * 320 / 4 * LV_COLOR_DEPTH / 8,
         .trans_size = 240 * 320 / 8 * LV_COLOR_DEPTH / 8,
         .sw_rotate = LV_DISPLAY_ROTATION_0,
         .lvgl_cfg.task_priority = 4,
