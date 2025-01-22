@@ -196,5 +196,7 @@ void init_wifi(void)
     }
 
     xTaskCreate(smartconfig_task, "smartconfig_task", 4096, NULL, 3, NULL);
-    ESP_LOGI(tag, "start smartconfig");
+    ESP_LOGI(tag, "start smartconfig and wait wifi connect");
+    xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
+                        pdFALSE, pdFALSE, portMAX_DELAY);
 }

@@ -5,7 +5,10 @@
  */
 
 #include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <inttypes.h>
+#include <errno.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -18,6 +21,8 @@
 #include "console_wifi.h"
 #include "esp_psram.h"
 #include "esp_chip_info.h"
+#include "esp_check.h"
+#include "esp_err.h"
 #include "lvgl.h"
 #include "i2c_new.h"
 #include "xl9555.h"
@@ -28,6 +33,11 @@
 #include "esp_littlefs.h"
 #include "smartconfig.h"
 #include "lv_demos.h"
+#include "tinyusb.h"
+#include "tusb_msc_storage.h"
+#include "mdns.h"
+#include "esp_sntp.h"
+#include "ftp.h"
 
 static const char *tag = "main";
 
@@ -45,7 +55,6 @@ static void monitoring_task(void *pvParameter)
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
-
 
 static void sdcard_init(void)
 {
@@ -110,6 +119,79 @@ static void littlefs_test(void)
     }
 }
 
+static esp_err_t spiflash_fat_mount(void)
+{
+    esp_err_t ret = ESP_OK;
+    wl_handle_t wl_handle = WL_INVALID_HANDLE;
+
+    const esp_vfs_fat_mount_config_t fat_mount_config = {
+        .max_files = 4,
+        .format_if_mount_failed = true,
+        .allocation_unit_size = CONFIG_WL_SECTOR_SIZE,
+    };
+
+    ret = esp_vfs_fat_spiflash_mount_rw_wl("/spiflash", "storage",
+                                           &fat_mount_config, &wl_handle);
+    ESP_GOTO_ON_ERROR(ret, err, tag, "failed to mount spiflash");
+
+    ESP_LOGI(tag, "mount spiflash ok");
+
+err:
+    return ret;
+}
+
+static esp_err_t init_mdns(void)
+{
+    esp_err_t ret = ESP_OK;
+
+    ret = mdns_init();
+    ESP_GOTO_ON_ERROR(ret, err, tag, "mdns init failed");
+    ret = mdns_hostname_set("ftp-server");
+    ESP_GOTO_ON_ERROR(ret, err, tag, "mdns set hostname failed");    
+    ESP_LOGI(tag, "mdns init ok");
+
+    return ret;
+
+err:
+    mdns_free();
+    return ret;
+}
+
+static esp_err_t sync_time(void)
+{
+    esp_err_t ret = ESP_OK;
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, CONFIG_NTP_SERVER);
+    esp_sntp_init();
+    ESP_LOGI(tag, "ntp init ok, ntp server is %s", CONFIG_NTP_SERVER);
+
+    int retry = 0;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET &&
+           ++retry < 10) {
+        ESP_LOGI(tag, "Waiting for system time to be set... (%d/10)", retry);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+
+    if (retry == 10) {
+        ESP_LOGE(tag, "get ntp time failed");
+        ret = ESP_FAIL;
+        return ret;
+    }
+
+    // Show current date & time
+    time_t now;
+    struct tm timeinfo;
+    char strftime_buf[64];
+    time(&now);
+    now = now + (CONFIG_LOCAL_TIMEZONE*60*60);
+    localtime_r(&now, &timeinfo);
+    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+    ESP_LOGI(tag, "The local date/time is: %s", strftime_buf);
+    ESP_LOGW(tag, "This server manages file timestamps in GMT.");
+
+    return ret;
+}
+
 void app_main(void)
 {
     esp_err_t ret;
@@ -147,10 +229,7 @@ void app_main(void)
     i2c_init(&i2c0);
     spi_init(&spi);
     sdcard_init();
-
-    littlefs_test();
-    // load_font_alipuhui();
-    init_wifi();
+    spiflash_fat_mount();
 
     /* 显示参数配置 */
     struct display_config disp_cfg = {
@@ -180,10 +259,13 @@ void app_main(void)
     ESP_LOGI(tag, "lv_color_t size: %d", sizeof(lv_color_t));
     lcd_init(&disp_cfg);
 
+    init_wifi();
+    init_mdns();
+    sync_time();
+
     // Lock the mutex due to the LVGL APIs are not thread-safe
-    lvgl_lock(-1);
     lvgl_test();
-    lvgl_unlock();
 
     xTaskCreatePinnedToCore(&monitoring_task, "monitor_task", 2048, NULL, 1, NULL, 1);
+    xTaskCreate(ftp_task, "FTP", 1024 * 6, NULL, 2, NULL);
 }
